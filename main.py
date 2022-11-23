@@ -1,96 +1,92 @@
 import csv
 import itertools
 from scipy.optimize import linprog
+import functools
+import numpy
+import json
 
-def scale(factor, x):
-    match type(x):
-        case list():
-            return [scale(factor, i) for i in x]
-        case _ :
-            return scale(factor, x)
-            
-            
-def nested_mutate(operand, operator):
-    return [nested_mutate(i, operator) for i in operand] if isinstance(operand, list) else operator(operand) if callable(operator) else operand
-a = 12
-b = '12'
-c = ['21', '12']
-d = [['2', '0'], ['23']]
+mul = lambda x : lambda y : x*y
 
+def simplex(target_nutrient, id_or_neg, ingredients, nutrients, matrix, filename, optimization_function, A_eq, b_eq, A_ub, b_ub, bounds):    
 
+    solution = linprog(
+        c = optimization_function,
+        A_eq = A_eq,
+        b_eq = b_eq,
+        A_ub = A_ub,
+        b_ub = b_ub,
+        bounds = bounds,
+        method = 'simplex'
+    )
+    
+    solution.fun = id_or_neg(solution.fun)
+    
+    recipe = list(zip(ingredients, nested(solution.x, lambda z : round(z*100.0, 1), 1)))
+    recipe = filter(lambda x : x[1] != 0.0, recipe)
+    recipe = list(recipe)
 
-a = nested_mutate(a, float)
-b = nested_mutate(b, float)
-c = nested_mutate(c, float)
-d = nested_mutate(d, 3)
+    matrix = [numpy.float64(i) for i in matrix]
+    matrix = numpy.float64(matrix)
+    nutritional_label = numpy.dot(matrix, solution.x)
+    nutritional_label = list(zip(nutrients, nutritional_label))
+    
+    file = open(filename, 'w')
+    file.write("{}\n{} : {}\n".format(solution.message, target_nutrient, solution.fun))
+    file.write("\nIngredients Used\n")
+    file.write("\n".join(["{}".format(i[0]) for i in recipe]))
+    file.write("\n\nRecipe\n")
+    file.write("\n".join(["{} : {}".format(i[0], i[1]) for i in recipe]))
+    
+    file.write("\n\nNutritional Label\n")
+    file.write("\n".join(["{} : {}".format(i[0], i[1]) for i in nutritional_label]))
 
-print(a, b, c, d)
-exit()
-def safe_iter(x):
-    return iter(x) if isinstance(x, list) else iter([x])
-
+    file.close()
+    
 def transpose(l):
     return map(list, itertools.zip_longest(*l, fillvalue=None))
-    
-def is_zero(vector):
-    aux = iter(vector)
-    try:
-        if next(aux) != 0:
-            return False
-    except StopIteration:
-        return True
+
+def nested(x, op, depth):
+    if depth == 0:
+        try:
+            return op(x)
+        except TypeError:
+            exit("operation is not callable")
+    return [nested(i, op, depth - 1) for i in x]
     
 def parse_document(filename):
-    matrix = iter(csv.reader(open(filename, 'r')))
-    nutrients = next(matrix)
-    del nutrients[0:2]
-    limits = next(matrix)
-    del limits[0:2]
-    matrix = transpose(matrix)
-    
-    first_limits = zip(mutate_all(next(matrix), float), mutate_all(next(matrix), float))
-    ingredients = next(matrix)
-    matrix = mutate_all(matrix, float)
-    return (nutrients, limits, matrix, first_limits, ingredients)
+    nutrients, limits, *matrix = csv.reader(open(filename, 'r'))
+    del nutrients[0:3]; del limits[0:3]
+    ingredients, lower, upper, *matrix = transpose(matrix)
+    for i in range(len(matrix)):
+        for j in range(len(matrix[i])):
+            if matrix[i][j] == 'None':
+                matrix[i][j] = 0.0
+    lower = nested(lower, lambda x : float(x)/100.0, 1)
+    upper = nested(upper, lambda x : float(x)/100.0, 1)
+    matrix = nested(matrix, float, 2)
+    bounds = list(zip(lower, upper))
+    return (nutrients, limits, matrix, bounds, ingredients)
 
-
-mutate_all = lambda operand, operator: lambda answer: operator(operand)
-  
-o = mutate_all()
-print(o(operand, operator))
-
-
-
-def min_or_max():
-    match input("minimize or maximize : "):
-        case 'min' | 'minimize':
-            return 1
-        case 'max' | 'maximize':
-            return -1
-        case _ :
-            min_or_max()
-
-def make_function(matrix, sign):
+def make_function(matrix, id_or_neg, search_term):
     try:
-        index = nutrients.index(input("Optimize : ").strip())
+        index_term = nutrients.index(search_term)
         try:
-            optimization_function = matrix[index].copy()
+            optimization_function = matrix[index_term].copy()
         except IndexError:
             exit("unreachable")
-        return nested_mutate(optimization_function, scale(sign))
+        return (nested(optimization_function, id_or_neg, 1), search_term)
     except ValueError:
-        make_function(matrix, sign)
-
+        make_function(matrix, id_or_neg)
 
 def get_constraints(matrix, limits):
     constraints = {
-    'equalities' : {
-        'vectors' : [],
-        'scalars' : [],
+        'equalities' : {
+            'vectors' : [],
+            'scalars' : [],
         },
-    'inequalities' : {
-        'vectors' : [],
-        'scalars' : [],
+        'inequalities' : {
+            'vectors' : [],
+            'scalars' : [],
         },
     }
     place = {
@@ -98,41 +94,74 @@ def get_constraints(matrix, limits):
         'L' : 'inequalities',
         'G' : 'inequalities',
     }
-    matrix = iter(matrix)
-    limits = iter(limits)
-    while True:
-        try:
-            vector = next(matrix)
-            limit = next(limits)
-        except StopIteration:
-            break
+    sign_mul = {
+        'E' : mul(1),
+        'L' : mul(1),
+        'G' : mul(-1),
+    }
+    for (vector, limit) in zip(matrix, limits):
         x = iter(limit.upper().split())
-        
         while True:
             try:
                 code = str(next(x))
                 value = float(next(x))
-                
-                    
             except StopIteration:
                 break
-            
+            try:
+                constraints[place[code]]['vectors'].append(nested(vector, sign_mul[code], 1))
+                constraints[place[code]]['scalars'].append(sign_mul[code](value))
+            except KeyError:
+                exit("unreachable")
     return constraints
     
+def erase_ingredients(bounds, ingredients, filename):
+    f = open(filename)
+    neg_ingredients = [i for i in f.read().split('\n') if i.strip() != '']
+    print(neg_ingredients)
+    for ni in neg_ingredients:
+        for (c, k) in enumerate(ingredients):
+            if k == ni:
+                bounds[c] = (0.0, 0.0)
+    f.close()
+    return None
+    
+def include_ingredients(nutrients, matrix, ingredients, bounds, filename):
+    f = open(filename).read()
+    j = json.loads(f)
+    extra_ingredients = []
+    for (i, v) in j.items():
+        ingredients.append(i)
+        bounds.append((0.0, float('Inf')))
+        new_vector = [0.0]*len(nutrients)
+        for (k, u) in v.items():
+            try:
+                h = nutrients.index(k)
+                new_vector[h] = float(u)
+            except KeyError:
+                exit("Nutrient {} is not found".format(h))
+            except ValueError:
+                exit("Value {} could not be converted to float".format(u))
+        print(new_vector)
+        extra_ingredients.append(new_vector)
+    extra_ingredients = list(transpose(extra_ingredients))
+    for i in range(len(matrix)):
+        matrix[i] = matrix[i] + extra_ingredients[i]
     
 if __name__ == "__main__":
     
-    sign = min_or_max()
-    del min_or_max
+    sign = mul(1)
+    
+    nutrients, limits, matrix, bounds, ingredients = parse_document('food_matrix.csv')
+    
+    include_ingredients(nutrients, matrix, ingredients, bounds, 'include_ingredients.json')
+    
+    erase_ingredients(bounds, ingredients, 'delete_ingredients.txt')
+    
+    optimization_function, target_nutrient = make_function(matrix, sign, 'carbohydrate, by difference')
 
-    nutrients, limits, matrix, first_limits, ingredients = parse_document('cure.csv')
-    del parse_document
-    
-    optimization_function = make_function(matrix, sign)
-    del make_function
-    
     constraints = get_constraints(matrix, limits)
-    del get_constraints
     
-    solution = simplex(optimization_function, constraints['equalities']['vectors'], constraints['equalities']['scalars'], constraints['inequalities']['vectors'], constraints['inequalities']['scalars'], first_limits)
+    solution = simplex(target_nutrient, sign, ingredients, nutrients, matrix, 'recipe.txt', optimization_function, constraints['equalities']['vectors'], constraints['equalities']['scalars'], constraints['inequalities']['vectors'], constraints['inequalities']['scalars'], bounds)
+ 
+    
     
